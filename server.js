@@ -1,8 +1,3 @@
-// ===================================================================
-// CONTROL DE VAJILLA ESCOLAR - API (Node.js + Express + MySQL)
-// Guías 1 a 4: retiros, devoluciones, informe diario, escaneo de carnet
-// y consulta de utensilios pendientes. Listo para Render + Aiven.
-// ===================================================================
 const express = require("express");
 const cors = require("cors");
 const mysql = require("mysql2");
@@ -12,7 +7,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------------- CONEXIÓN A LA BASE DE DATOS ----------------
 const env = (...nombres) => {
   for (const n of nombres) if (process.env[n]) return process.env[n];
   return undefined;
@@ -20,7 +14,7 @@ const env = (...nombres) => {
 const host = env("DB_HOST", "MYSQLHOST", "MYSQL_HOST") || "localhost";
 const usarSSL = process.env.DB_SSL === "true" || host.includes("aivencloud.com");
 const DB_NAME = env("DB_NAME", "MYSQLDATABASE") || "cocina_escolar";
-const ZONA = process.env.DB_TZ || "-06:00"; // hora de El Salvador (para que "hoy" sea hoy)
+const ZONA = process.env.DB_TZ || "-06:00";
 
 const configBase = {
   host,
@@ -35,27 +29,25 @@ const pool = mysql.createPool({
   database: DB_NAME,
   waitForConnections: true,
   connectionLimit: 5,
-  dateStrings: true, // fechas como "2026-10-21 08:30:00"
+  dateStrings: true,
   charset: "utf8mb4",
 });
 pool.on("connection", (conn) => conn.query(`SET time_zone = '${ZONA}'`));
 const db = pool.promise();
 
-// Captura errores de cada ruta sin tumbar el servidor
 const ruta = (fn) => (req, res) =>
   fn(req, res).catch((e) => {
     console.error(e);
     res.status(500).json({ status: "error", mensaje: e.message });
   });
 
-// ---------------- CREACIÓN DE LA BASE Y LAS TABLAS ----------------
 async function crearBaseSiNoExiste() {
   try {
     const c = await mysqlP.createConnection(configBase);
     await c.query(`CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4`);
     await c.end();
   } catch (e) {
-    console.warn("Aviso al crear la base (si ya existe no pasa nada):", e.message);
+    console.warn("Aviso al crear la base:", e.message);
   }
 }
 
@@ -79,23 +71,22 @@ async function iniciarBD() {
     FOREIGN KEY (estudiante_id) REFERENCES estudiantes(id),
     FOREIGN KEY (utensilio_id) REFERENCES utensilios(id)
   )`);
-  // Utensilios iniciales
   for (const tipo of ["Plato", "Vaso", "Taza"]) {
     await db.query("INSERT IGNORE INTO utensilios (tipo) VALUES (?)", [tipo]);
   }
 }
 
-// ---------------- AYUDAS ----------------
-// Busca un estudiante por carnet o por el código de barras escaneado
 async function buscarEstudiante(codigo) {
+  const c = String(codigo).trim();
   const [r] = await db.query(
     "SELECT id, nombre, carnet, codigo_barra FROM estudiantes WHERE carnet = ? OR codigo_barra = ? LIMIT 1",
-    [String(codigo).trim(), String(codigo).trim()]
+    [c, c]
   );
   return r[0] || null;
 }
 
-// ---------------- ESTUDIANTES ----------------
+const fechaValida = (f) => (/^\d{4}-\d{2}-\d{2}$/.test(f || "") ? f : null);
+
 app.get("/estudiantes", ruta(async (req, res) => {
   const [r] = await db.query("SELECT id, nombre, carnet, codigo_barra FROM estudiantes ORDER BY nombre");
   res.json(r);
@@ -130,14 +121,11 @@ app.delete("/estudiantes/:id", ruta(async (req, res) => {
   res.json({ status: "ok", mensaje: "Estudiante eliminado" });
 }));
 
-// ---------------- UTENSILIOS ----------------
 app.get("/utensilios", ruta(async (req, res) => {
   const [r] = await db.query("SELECT id, tipo FROM utensilios ORDER BY id");
   res.json(r);
 }));
 
-// ---------------- RETIRO Y DEVOLUCIÓN ----------------
-// Body: { carnet, utensilio_id (id o nombre: "Plato"), cantidad (opcional) }
 app.post("/retiro", ruta(async (req, res) => {
   const codigo = req.body.carnet ?? req.body.estudiante_id;
   const cantidad = Math.min(Math.max(parseInt(req.body.cantidad) || 1, 1), 20);
@@ -169,6 +157,28 @@ app.put("/devolucion/:id", ruta(async (req, res) => {
   res.json({ status: "ok", mensaje: "Devolución registrada" });
 }));
 
+app.put("/devolucionCarnet/:codigo", ruta(async (req, res) => {
+  const est = await buscarEstudiante(req.params.codigo);
+  if (!est) return res.json({ status: "error", mensaje: "Ese carnet no está registrado" });
+  const [ult] = await db.query(
+    `SELECT m.id, u.tipo FROM movimientos m
+     JOIN utensilios u ON m.utensilio_id = u.id
+     WHERE m.estudiante_id = ? AND m.fecha_devolucion IS NULL
+     ORDER BY m.fecha_retiro DESC, m.id DESC LIMIT 1`,
+    [est.id]
+  );
+  if (!ult.length) return res.json({ status: "error", mensaje: `${est.nombre} no tiene utensilios pendientes` });
+  await db.query("UPDATE movimientos SET fecha_devolucion = NOW() WHERE id = ?", [ult[0].id]);
+  const [resto] = await db.query(
+    "SELECT COUNT(*) AS n FROM movimientos WHERE estudiante_id = ? AND fecha_devolucion IS NULL",
+    [est.id]
+  );
+  res.json({
+    status: "ok",
+    mensaje: `Devolución registrada: ${ult[0].tipo} de ${est.nombre}. Le quedan ${resto[0].n} pendiente(s)`,
+  });
+}));
+
 app.put("/devolver-todo/:codigo", ruta(async (req, res) => {
   const est = await buscarEstudiante(req.params.codigo);
   if (!est) return res.json({ status: "error", mensaje: "Ese carnet no está registrado" });
@@ -179,8 +189,6 @@ app.put("/devolver-todo/:codigo", ruta(async (req, res) => {
   res.json({ status: "ok", mensaje: `${r.affectedRows} utensilio(s) devuelto(s) por ${est.nombre}` });
 }));
 
-// ---------------- PENDIENTES ----------------
-// Todos los pendientes del colegio
 app.get("/pendientes", ruta(async (req, res) => {
   const [r] = await db.query(
     `SELECT m.id, u.tipo, m.fecha_retiro, e.nombre AS estudiante, e.carnet
@@ -193,7 +201,6 @@ app.get("/pendientes", ruta(async (req, res) => {
   res.json(r);
 }));
 
-// Pendientes de un estudiante (por carnet o código de barras)
 app.get("/pendientes/:codigo", ruta(async (req, res) => {
   const est = await buscarEstudiante(req.params.codigo);
   if (!est) return res.json({ status: "error", mensaje: "Ese carnet no está registrado" });
@@ -208,11 +215,7 @@ app.get("/pendientes/:codigo", ruta(async (req, res) => {
   res.json(r);
 }));
 
-// ---------------- INFORME DIARIO ----------------
-// /informe            -> de hoy
-// /informe?fecha=2026-10-21
-app.get("/informe", ruta(async (req, res) => {
-  const fecha = /^\d{4}-\d{2}-\d{2}$/.test(req.query.fecha || "") ? req.query.fecha : null;
+async function informeDia(fecha) {
   const [r] = await db.query(
     `SELECT u.id, u.tipo,
             COUNT(m.id) AS entregados,
@@ -224,17 +227,42 @@ app.get("/informe", ruta(async (req, res) => {
      ORDER BY u.id`,
     [fecha]
   );
+  return r;
+}
+
+app.get("/informe", ruta(async (req, res) => {
+  res.json(await informeDia(fechaValida(req.query.fecha)));
+}));
+
+app.get("/informe/rango", ruta(async (req, res) => {
+  let desde = fechaValida(req.query.desde);
+  let hasta = fechaValida(req.query.hasta);
+  if (desde && hasta && desde > hasta) [desde, hasta] = [hasta, desde];
+  const [r] = await db.query(
+    `SELECT DATE(m.fecha_retiro) AS fecha, u.tipo,
+            COUNT(m.id) AS entregados,
+            COALESCE(SUM(m.fecha_devolucion IS NOT NULL), 0) AS devueltos,
+            COALESCE(SUM(m.fecha_devolucion IS NULL), 0) AS pendientes
+     FROM movimientos m
+     JOIN utensilios u ON m.utensilio_id = u.id
+     WHERE DATE(m.fecha_retiro) BETWEEN COALESCE(?, CURDATE()) AND COALESCE(?, CURDATE())
+     GROUP BY DATE(m.fecha_retiro), u.id, u.tipo
+     ORDER BY DATE(m.fecha_retiro) DESC, u.id`,
+    [desde, hasta]
+  );
   res.json(r);
 }));
 
-// ---------------- PRUEBA Y ERRORES ----------------
+app.get("/informe/:fecha", ruta(async (req, res) => {
+  res.json(await informeDia(fechaValida(req.params.fecha)));
+}));
+
 app.get("/", (req, res) => res.json({ status: "ok", mensaje: "API Control de Vajilla Escolar funcionando" }));
 
 app.use((err, req, res, next) => {
   res.status(400).json({ status: "error", mensaje: err.message });
 });
 
-// ---------------- ARRANQUE ----------------
 const PUERTO = process.env.PORT || 3000;
 (async () => {
   try {
